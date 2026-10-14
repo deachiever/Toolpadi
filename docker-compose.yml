@@ -1,0 +1,66 @@
+version: '3.8'
+
+services:
+  # Primary PostgreSQL Database Service
+  postgres:
+    image: postgres:16-alpine
+    container_name: toolpadi_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-toolpadi}
+      POSTGRES_USER: ${POSTGRES_USER:-toolpadi_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_this_strong_password_in_production}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      # Expose locally for management/backups (disable or bind to 127.0.0.1 in production)
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-toolpadi_user} -d ${POSTGRES_DB:-toolpadi}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - toolpadi_network
+
+  # ToolPadi Application Service
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: toolpadi_web
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      # Database connection string to PostgreSQL container
+      DATABASE_URL: postgresql://${POSTGRES_USER:-toolpadi_user}:${POSTGRES_PASSWORD:-change_this_strong_password_in_production}@postgres:5432/${POSTGRES_DB:-toolpadi}
+      # Secrets (pass through from environment or .env file)
+      INSIGHT_API_KEY: ${INSIGHT_API_KEY}
+      ADMIN_SECRET_KEY: ${ADMIN_SECRET_KEY:-TOOLPADI_ADMIN_SECURE_KEY_2026}
+      PAYMENT_MODE: ${PAYMENT_MODE:-sandbox_simulator}
+      PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET}
+      DEFAULT_USD_NGN_RATE: ${DEFAULT_USD_NGN_RATE:-1450}
+      EMAIL_PROVIDER: ${EMAIL_PROVIDER:-console_log}
+      STORAGE_PROVIDER: ${STORAGE_PROVIDER:-local_disk}
+      SCHEDULER_MODE: ${SCHEDULER_MODE:-in_process}
+    volumes:
+      - uploads_data:/app/uploads
+    networks:
+      - toolpadi_network
+
+volumes:
+  postgres_data:
+    driver: local
+  uploads_data:
+    driver: local
+
+networks:
+  toolpadi_network:
+    driver: bridge

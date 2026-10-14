@@ -1,0 +1,6 @@
+{
+  "name": "ToolPadi",
+  "description": "Africa-first digital tools marketplace making essential creative, developer, and productivity software accessible with transparent pricing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
