@@ -132,8 +132,13 @@ export const CheckoutView: React.FC<CheckoutViewProps> = ({ onSuccess, onBack })
       const orderResp = await fetch(`/api/orders/${activePaymentSession.order_reference}`);
       const orderData = await orderResp.json();
 
+      const finalOrder = orderData.order || data.order;
+      const finalDeliveries = (orderData.deliveries && orderData.deliveries.length > 0)
+        ? orderData.deliveries
+        : (data.deliveries || []);
+
       clearCart();
-      onSuccess(orderData.order, orderData.deliveries || []);
+      onSuccess(finalOrder, finalDeliveries);
     } catch (err: any) {
       setErrorMessage(err.message);
     } finally {

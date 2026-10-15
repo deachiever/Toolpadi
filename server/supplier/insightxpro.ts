@@ -300,9 +300,9 @@ export class InsightXProClient implements ISupplierAdapter {
 
   /**
    * Supplier Order Fulfilment:
-   * Kept strictly gated until explicit merchant checkout is enabled.
+   * Places an order to InsightXPro API with idempotency.
    */
-  async placeOrder(req: { product_id: number | string; quantity?: number; idempotency_key: string }) {
+  async placeOrder(req: { product_id: number | string; quantity?: number; idempotency_key: string }): Promise<any> {
     const apiKey = this.getApiKey();
     if (!apiKey) {
       throw new Error('Cannot fulfill order: InsightXPro API key is not configured.');
@@ -310,6 +310,7 @@ export class InsightXProClient implements ISupplierAdapter {
 
     logger.info('Placing order to InsightXPro API', {
       product_id: req.product_id,
+      quantity: req.quantity || 1,
       idempotency_key: req.idempotency_key
     });
 
@@ -334,6 +335,148 @@ export class InsightXProClient implements ISupplierAdapter {
 
     return await resp.json();
   }
+
+  /**
+   * Retrieves live status of a previously placed supplier order:
+   * GET https://api.insightxpro.store/api/v1/orders/{order_id}
+   */
+  async getOrderStatus(orderId: number | string): Promise<any> {
+    const apiKey = this.getApiKey();
+    if (!apiKey) {
+      throw new Error('InsightXPro API key is not configured.');
+    }
+
+    const endpoint = `${this.getBaseUrl()}/api/v1/orders/${orderId}`;
+    const resp = await fetch(endpoint, {
+      method: 'GET',
+      headers: {
+        'X-API-Key': apiKey,
+        'Accept': 'application/json'
+      }
+    });
+
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error((err as any).error || `InsightXPro order status query failed with HTTP ${resp.status}`);
+    }
+
+    return await resp.json();
+  }
+}
+
+export interface ExtractedFulfilmentItem {
+  delivery_format: 'redemption_url' | 'license_key' | 'coupon_code' | 'account_credentials' | 'activation_code';
+  delivery_content: string;
+  redemption_url?: string;
+  instructions: string;
+}
+
+export interface ExtractedSupplierOrder {
+  supplier_order_id: string | null;
+  supplier_status: 'completed' | 'pending' | 'processing' | 'failed';
+  items: ExtractedFulfilmentItem[];
+  raw_sanitized: any;
+}
+
+/**
+ * Standardizes raw supplier response from InsightXPro into documented ToolPadi fulfilment model.
+ * Never outputs "undefined" or synthetic values when actual supplier codes/links are present.
+ */
+export function extractSupplierFulfilment(rawResponse: any, fallbackInstructions?: string): ExtractedSupplierOrder {
+  if (!rawResponse || typeof rawResponse !== 'object') {
+    return {
+      supplier_order_id: null,
+      supplier_status: 'failed',
+      items: [],
+      raw_sanitized: { error: 'Empty or invalid response from supplier' }
+    };
+  }
+
+  const orderObj = rawResponse.order || rawResponse.data || rawResponse;
+  const supplierOrderId = orderObj.supplier_order_id
+    || orderObj.supplier_reference
+    || (orderObj.order_id !== undefined ? String(orderObj.order_id) : null)
+    || (orderObj.id !== undefined ? String(orderObj.id) : null)
+    || (rawResponse.order_id ? String(rawResponse.order_id) : null);
+
+  const rawStatus = (orderObj.status || rawResponse.status || '').toLowerCase();
+  let supplierStatus: 'completed' | 'pending' | 'processing' | 'failed' = 'pending';
+
+  if (rawStatus === 'completed' || rawStatus === 'success' || rawStatus === 'delivered') {
+    supplierStatus = 'completed';
+  } else if (rawStatus === 'failed' || rawStatus === 'rejected' || rawStatus === 'cancelled') {
+    supplierStatus = 'failed';
+  } else if (rawStatus === 'processing' || rawStatus === 'in_progress') {
+    supplierStatus = 'processing';
+  }
+
+  // Gather all codes, coupons, and links
+  const extractedList: string[] = [];
+
+  if (Array.isArray(orderObj.codes)) {
+    for (const c of orderObj.codes) {
+      if (typeof c === 'string' && c.trim()) extractedList.push(c.trim());
+    }
+  }
+
+  if (Array.isArray(orderObj.coupons)) {
+    for (const c of orderObj.coupons) {
+      if (typeof c === 'string' && c.trim() && !extractedList.includes(c.trim())) {
+        extractedList.push(c.trim());
+      }
+    }
+  }
+
+  const singleCandidate = orderObj.license || orderObj.licence || orderObj.code || orderObj.link || orderObj.redemption_url || rawResponse.code || rawResponse.license;
+  if (typeof singleCandidate === 'string' && singleCandidate.trim() && !extractedList.includes(singleCandidate.trim())) {
+    extractedList.push(singleCandidate.trim());
+  }
+
+  // If we found valid delivered credentials or links, mark status as completed
+  if (extractedList.length > 0 && supplierStatus !== 'failed') {
+    supplierStatus = 'completed';
+  }
+
+  const items: ExtractedFulfilmentItem[] = extractedList.map((token) => {
+    const isUrl = token.startsWith('http://') || token.startsWith('https://');
+    if (isUrl) {
+      return {
+        delivery_format: 'redemption_url',
+        delivery_content: token,
+        redemption_url: token,
+        instructions: fallbackInstructions || 'Open your unique activation URL to redeem and link your subscription directly on the service portal.'
+      };
+    }
+
+    const isCoupon = token.toLowerCase().includes('coupon') || token.toLowerCase().includes('promo');
+    if (isCoupon) {
+      return {
+        delivery_format: 'coupon_code',
+        delivery_content: token,
+        instructions: fallbackInstructions || 'Enter this redemption coupon code at checkout on the provider platform.'
+      };
+    }
+
+    return {
+      delivery_format: 'license_key',
+      delivery_content: token,
+      instructions: fallbackInstructions || 'Enter this activation license key into your software or account settings to unlock access.'
+    };
+  });
+
+  return {
+    supplier_order_id: supplierOrderId,
+    supplier_status: supplierStatus,
+    items,
+    raw_sanitized: {
+      supplier_order_id: supplierOrderId,
+      product_id: orderObj.product_id,
+      product_name: orderObj.product_name,
+      status: orderObj.status,
+      items_count: items.length,
+      created_at: orderObj.created_at
+    }
+  };
 }
 
 export const insightXProClient = new InsightXProClient();

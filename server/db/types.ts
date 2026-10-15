@@ -131,6 +131,10 @@ export interface Order {
   fulfilment_status: 'unfulfilled' | 'processing' | 'fulfilled' | 'failed';
   idempotency_key: string;
   notes: string | null;
+  supplier_order_id?: string | null;
+  supplier_reference?: string | null;
+  supplier_status?: string | null;
+  supplier_raw_response?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -152,7 +156,11 @@ export interface Delivery {
   order_id: string;
   order_item_id: string;
   delivery_type: string;
+  delivery_format?: 'redemption_url' | 'license_key' | 'coupon_code' | 'account_credentials' | 'activation_code';
   license_code_or_credential: string;
+  redemption_url?: string | null;
+  supplier_order_id?: string | null;
+  raw_code_or_link?: string | null;
   delivery_status: 'delivered' | 'pending' | 'revoked';
   instructions: string;
   access_expires_at: string | null;

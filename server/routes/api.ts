@@ -3,8 +3,8 @@ import crypto from 'node:crypto';
 import { dbService } from '../db/index.js';
 import { computeProductPricing, computeBulkUnitPrice, getPricingEngineContext } from '../services/pricing.js';
 import { paymentAdapter } from '../payments/adapter.js';
-import { insightXProClient } from '../supplier/insightxpro.js';
-import type { Product, PricingRule, Order, Customer } from '../db/types.js';
+import { insightXProClient, extractSupplierFulfilment } from '../supplier/insightxpro.js';
+import type { Product, PricingRule, Order, Customer, Delivery, OrderItem } from '../db/types.js';
 
 export const apiRouter = Router();
 
@@ -470,7 +470,7 @@ apiRouter.post('/payments/verify', async (req, res) => {
 apiRouter.get('/orders/:reference', async (req, res) => {
   try {
     const { reference } = req.params;
-    const { email } = req.query;
+    const requesterEmail = (req.query.email as string) || (req.headers['x-customer-email'] as string);
 
     const order = await dbService.queryOne<Order>(`
       SELECT * FROM orders WHERE order_reference = ?
@@ -480,8 +480,8 @@ apiRouter.get('/orders/:reference', async (req, res) => {
       return res.status(404).json({ error: 'Order not found.' });
     }
 
-    if (email && String(email).trim().toLowerCase() !== order.customer_email.toLowerCase()) {
-      return res.status(403).json({ error: 'Order email does not match.' });
+    if (requesterEmail && String(requesterEmail).trim().toLowerCase() !== order.customer_email.toLowerCase()) {
+      return res.status(403).json({ error: "Order email does not match. Unauthorized customer access blocked." });
     }
 
     const items = await dbService.query(`SELECT * FROM order_items WHERE order_id = ?`, [order.id]);
@@ -492,6 +492,122 @@ apiRouter.get('/orders/:reference', async (req, res) => {
     `, [order.id]);
 
     res.json({ order, items, deliveries, transactions });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Sync order fulfilment status directly from supplier
+apiRouter.post('/orders/:reference/sync', async (req, res) => {
+  try {
+    const { reference } = req.params;
+    const order = await dbService.queryOne<Order>(`
+      SELECT * FROM orders WHERE order_reference = ?
+    `, [reference]);
+
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found.' });
+    }
+
+    const currentDeliveries = await dbService.query<Delivery>(`
+      SELECT * FROM deliveries WHERE order_id = ?
+    `, [order.id]);
+
+    const items = await dbService.query<OrderItem>(`
+      SELECT * FROM order_items WHERE order_id = ?
+    `, [order.id]);
+
+    const totalQty = items.reduce((acc, it) => acc + it.quantity, 0);
+
+    // If already fully delivered, return immediately
+    if (order.fulfilment_status === 'fulfilled' && currentDeliveries.length >= totalQty) {
+      return res.json({
+        success: true,
+        order,
+        deliveries: currentDeliveries,
+        message: 'Order is completely fulfilled.'
+      });
+    }
+
+    // If order has a supplier_order_id and InsightXPro is configured, query supplier status
+    if (order.supplier_order_id && insightXProClient.isConfigured()) {
+      try {
+        const supplierStatusResp = await insightXProClient.getOrderStatus(order.supplier_order_id);
+        const extracted = extractSupplierFulfilment(supplierStatusResp);
+
+        if (extracted.items.length > 0 && currentDeliveries.length < totalQty) {
+          const now = new Date().toISOString();
+          const firstItem = items[0];
+
+          for (const delItem of extracted.items) {
+            // Check if already inserted
+            const alreadyExists = currentDeliveries.some(d => d.license_code_or_credential === delItem.delivery_content);
+            if (!alreadyExists) {
+              await dbService.run(`
+                INSERT INTO deliveries (
+                  id, order_id, order_item_id, delivery_type, delivery_format,
+                  license_code_or_credential, redemption_url, supplier_order_id, raw_code_or_link,
+                  delivery_status, instructions, access_expires_at, delivered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delivered', ?, ?, ?)
+              `, [
+                `del-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+                order.id,
+                firstItem ? firstItem.id : 'unknown',
+                firstItem ? firstItem.access_type : 'digital_access',
+                delItem.delivery_format,
+                delItem.delivery_content,
+                delItem.redemption_url || null,
+                extracted.supplier_order_id,
+                delItem.delivery_content,
+                delItem.instructions,
+                null,
+                now
+              ]);
+            }
+          }
+
+          const freshDeliveries = await dbService.query<Delivery>(`
+            SELECT * FROM deliveries WHERE order_id = ?
+          `, [order.id]);
+
+          const isNowFulfilled = freshDeliveries.length >= totalQty;
+
+          await dbService.run(`
+            UPDATE orders
+            SET fulfilment_status = ?, supplier_status = ?, updated_at = ?
+            WHERE id = ?
+          `, [isNowFulfilled ? 'fulfilled' : 'processing', extracted.supplier_status, now, order.id]);
+
+          const refreshedOrder = await dbService.queryOne<Order>(`
+            SELECT * FROM orders WHERE id = ?
+          `, [order.id]);
+
+          return res.json({
+            success: true,
+            order: refreshedOrder,
+            deliveries: freshDeliveries,
+            message: isNowFulfilled
+              ? 'Supplier finished processing. Delivered access credentials.'
+              : 'Supplier order still in progress.'
+          });
+        }
+      } catch (err: any) {
+        console.warn(`[Order Sync] Failed checking supplier order ${order.supplier_order_id}: ${err.message}`);
+      }
+    }
+
+    const latestDeliveries = await dbService.query<Delivery>(`
+      SELECT * FROM deliveries WHERE order_id = ?
+    `, [order.id]);
+
+    res.json({
+      success: true,
+      order,
+      deliveries: latestDeliveries,
+      message: latestDeliveries.length >= totalQty
+        ? 'Order is fulfilled.'
+        : 'Order is currently being prepared by the supplier network.'
+    });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }

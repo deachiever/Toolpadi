@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Search, ShieldCheck, Copy, Check, Eye, EyeOff, Package, AlertCircle, RefreshCw } from 'lucide-react';
+import { Search, ShieldCheck, Copy, Check, Eye, EyeOff, Package, AlertCircle, RefreshCw, ExternalLink } from 'lucide-react';
 import type { Order, Delivery } from '../types.js';
 
 interface CustomerAccountViewProps {
@@ -36,12 +36,16 @@ export const CustomerAccountView: React.FC<CustomerAccountViewProps> = ({
       if (lookupType === 'reference') {
         const ref = orderReference.trim();
         if (!ref) throw new Error('Please enter a valid order reference (e.g. TP-2026-XXXX).');
+        const em = email.trim();
+        const url = em
+          ? `/api/orders/${encodeURIComponent(ref)}?email=${encodeURIComponent(em)}`
+          : `/api/orders/${encodeURIComponent(ref)}`;
 
-        const resp = await fetch(`/api/orders/${encodeURIComponent(ref)}`);
+        const resp = await fetch(url);
         const data = await resp.json();
 
         if (!resp.ok) {
-          throw new Error(data.error || 'Order not found.');
+          throw new Error(data.error || 'Order not found or authorization failed.');
         }
 
         setSingleOrderResult(data);
@@ -73,7 +77,7 @@ export const CustomerAccountView: React.FC<CustomerAccountViewProps> = ({
     setIsLoading(true);
     setErrorMessage(null);
     try {
-      const resp = await fetch(`/api/orders/${encodeURIComponent(ref)}`);
+      const resp = await fetch(`/api/orders/${encodeURIComponent(ref)}?email=${encodeURIComponent(email.trim())}`);
       const data = await resp.json();
       if (!resp.ok) throw new Error(data.error || 'Order lookup failed.');
       setSingleOrderResult(data);
@@ -133,25 +137,40 @@ export const CustomerAccountView: React.FC<CustomerAccountViewProps> = ({
 
         <form onSubmit={handleLookup} className="space-y-4">
           {lookupType === 'reference' ? (
-            <div>
-              <label className="block text-xs font-semibold text-[#2f3d35] mb-1">
-                Order Reference Number
-              </label>
-              <div className="flex gap-2">
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-semibold text-[#2f3d35] mb-1">
+                  Order Reference Number
+                </label>
                 <input
                   type="text"
-                  placeholder="e.g. TP-2026-4819"
+                  placeholder="e.g. TP-2026-3924"
                   value={orderReference}
                   onChange={(e) => setOrderReference(e.target.value)}
-                  className="flex-1 px-3.5 py-2.5 bg-[#faf9f5] border border-[#d8d3c5] rounded-lg text-sm font-mono text-[#141f1a] focus:ring-2 focus:ring-[#0e382b] focus:outline-none uppercase"
+                  className="w-full px-3.5 py-2.5 bg-[#faf9f5] border border-[#d8d3c5] rounded-lg text-sm font-mono text-[#141f1a] focus:ring-2 focus:ring-[#0e382b] focus:outline-none uppercase"
                 />
-                <button
-                  type="submit"
-                  disabled={isLoading}
-                  className="py-2.5 px-5 bg-[#0e382b] hover:bg-[#134e3a] text-white font-semibold text-xs rounded-lg transition-colors cursor-pointer shrink-0"
-                >
-                  {isLoading ? 'Searching...' : 'Find Order'}
-                </button>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-[#2f3d35] mb-1">
+                  Purchaser Email Address <span className="text-[#65736b] font-normal">(Security verification)</span>
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    type="email"
+                    placeholder="e.g. your-email@gmail.com"
+                    value={email}
+                    onChange={(e) => setEmail(e.target.value)}
+                    className="flex-1 px-3.5 py-2.5 bg-[#faf9f5] border border-[#d8d3c5] rounded-lg text-sm text-[#141f1a] focus:ring-2 focus:ring-[#0e382b] focus:outline-none"
+                  />
+                  <button
+                    type="submit"
+                    disabled={isLoading}
+                    className="py-2.5 px-5 bg-[#0e382b] hover:bg-[#134e3a] text-white font-semibold text-xs rounded-lg transition-colors cursor-pointer shrink-0"
+                  >
+                    {isLoading ? 'Searching...' : 'Find Order'}
+                  </button>
+                </div>
               </div>
             </div>
           ) : (
@@ -278,40 +297,83 @@ export const CustomerAccountView: React.FC<CustomerAccountViewProps> = ({
             ) : (
               singleOrderResult.deliveries.map((del, i) => {
                 const isRevealed = revealedKeys[del.id] ?? false;
+                const content = del.license_code_or_credential;
+                const isUrl = content.startsWith('http://') || content.startsWith('https://');
+
                 return (
                   <div key={del.id} className="p-5 border border-[#e0dacb] rounded-xl bg-[#fdfdfb] space-y-3 text-xs">
-                    <div className="flex items-center justify-between">
-                      <span className="font-bold text-[#0e382b]">
-                        License #{i + 1} ({del.delivery_type.replace(/_/g, ' ')})
-                      </span>
-                      <span className="text-[#1a634b] font-medium">Status: {del.delivery_status}</span>
-                    </div>
-
-                    <div className="space-y-1">
-                      <div className="flex items-center justify-between">
-                        <span className="text-[#65736b]">Credential / Key:</span>
-                        <button
-                          onClick={() => toggleReveal(del.id)}
-                          className="text-[#0e382b] hover:underline flex items-center gap-1 cursor-pointer font-medium"
-                        >
-                          {isRevealed ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                          <span>{isRevealed ? 'Hide' : 'Reveal'}</span>
-                        </button>
-                      </div>
-
+                    <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="flex items-center gap-2">
-                        <div className="flex-1 bg-[#f4f1ea] border border-[#dcd7cb] rounded-lg px-3 py-2 font-mono text-xs text-[#0e382b] overflow-x-auto select-all">
-                          {isRevealed ? del.license_code_or_credential : '••••••••••••••••••••••••••••••••'}
-                        </div>
-                        <button
-                          onClick={() => handleCopy(del.license_code_or_credential, del.id)}
-                          className="py-2 px-3 bg-[#0e382b] text-white rounded-lg text-xs font-semibold hover:bg-[#134e3a] cursor-pointer flex items-center gap-1"
-                        >
-                          {copiedKey === del.id ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                          <span>{copiedKey === del.id ? 'Copied' : 'Copy'}</span>
-                        </button>
+                        <span className="font-bold text-[#0e382b]">
+                          Asset #{i + 1} ({isUrl ? 'Redemption Link' : del.delivery_type.replace(/_/g, ' ')})
+                        </span>
+                        {del.supplier_order_id && (
+                          <span className="text-[10px] bg-[#f4f1ea] px-2 py-0.5 rounded font-mono text-[#526058] border border-[#e2ddd0]">
+                            Supplier #{del.supplier_order_id}
+                          </span>
+                        )}
                       </div>
+                      <span className="text-[#1a634b] font-medium bg-[#f0fdf4] px-2 py-0.5 rounded border border-[#bbf7d0]">
+                        Status: {del.delivery_status}
+                      </span>
                     </div>
+
+                    {isUrl ? (
+                      <div className="p-3 bg-[#f0fdf4] border border-[#bbf7d0] rounded-lg space-y-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-semibold text-[#15803d]">Unique Activation URL:</span>
+                          <a
+                            href={content}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="py-1.5 px-3 bg-[#16a34a] hover:bg-[#15803d] text-white rounded text-xs font-bold inline-flex items-center gap-1 transition-colors"
+                          >
+                            <span>Open Link</span>
+                            <ExternalLink className="w-3 h-3" />
+                          </a>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="text"
+                            readOnly
+                            value={content}
+                            className="flex-1 bg-white border border-[#bbf7d0] rounded px-2.5 py-1.5 font-mono text-xs text-[#0e382b] select-all"
+                          />
+                          <button
+                            onClick={() => handleCopy(content, del.id)}
+                            className="py-1.5 px-3 bg-white border border-[#bbf7d0] text-[#166534] rounded text-xs font-semibold hover:bg-[#f0fdf4]"
+                          >
+                            {copiedKey === del.id ? 'Copied' : 'Copy'}
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[#65736b]">Credential / Key:</span>
+                          <button
+                            onClick={() => toggleReveal(del.id)}
+                            className="text-[#0e382b] hover:underline flex items-center gap-1 cursor-pointer font-medium"
+                          >
+                            {isRevealed ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                            <span>{isRevealed ? 'Hide' : 'Reveal'}</span>
+                          </button>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <div className="flex-1 bg-[#f4f1ea] border border-[#dcd7cb] rounded-lg px-3 py-2 font-mono text-xs text-[#0e382b] overflow-x-auto select-all">
+                            {isRevealed ? content : '••••••••••••••••••••••••••••••••'}
+                          </div>
+                          <button
+                            onClick={() => handleCopy(content, del.id)}
+                            className="py-2 px-3 bg-[#0e382b] text-white rounded-lg text-xs font-semibold hover:bg-[#134e3a] cursor-pointer flex items-center gap-1"
+                          >
+                            {copiedKey === del.id ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                            <span>{copiedKey === del.id ? 'Copied' : 'Copy'}</span>
+                          </button>
+                        </div>
+                      </div>
+                    )}
 
                     <div className="p-3 bg-[#faf8f2] rounded-lg border border-[#e8e2d4] text-[11px] text-[#4f5c54]">
                       <strong>Instructions: </strong> {del.instructions}

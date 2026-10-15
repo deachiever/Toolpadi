@@ -216,5 +216,20 @@ export const migrations: Migration[] = [
 
       CREATE INDEX IF NOT EXISTS idx_bulk_tiers_product ON product_bulk_pricing_tiers(product_id);
     `
+  },
+  {
+    id: 4,
+    name: 'supplier_fulfilment_and_digital_delivery',
+    sql: `
+      ALTER TABLE orders ADD COLUMN supplier_order_id TEXT;
+      ALTER TABLE orders ADD COLUMN supplier_reference TEXT;
+      ALTER TABLE orders ADD COLUMN supplier_status TEXT DEFAULT 'unprocessed';
+      ALTER TABLE orders ADD COLUMN supplier_raw_response TEXT;
+
+      ALTER TABLE deliveries ADD COLUMN delivery_format TEXT DEFAULT 'license_key';
+      ALTER TABLE deliveries ADD COLUMN redemption_url TEXT;
+      ALTER TABLE deliveries ADD COLUMN supplier_order_id TEXT;
+      ALTER TABLE deliveries ADD COLUMN raw_code_or_link TEXT;
+    `
   }
 ];

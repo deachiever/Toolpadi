@@ -949,7 +949,7 @@ export const AdminView: React.FC<AdminViewProps> = ({ onBackToStore }) => {
           <ShieldCheck className="w-3.5 h-3.5 text-[#16a34a]" />
           <span>Verification & QA Suite</span>
           <span className="px-1.5 py-0.2 bg-[#dcfce7] text-[#15803d] rounded-full text-[10px] font-bold">
-            82 Tests
+            92 Tests
           </span>
         </button>
       </div>

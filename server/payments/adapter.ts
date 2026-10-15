@@ -1,7 +1,8 @@
 import crypto from 'node:crypto';
 import { dbService } from '../db/index.js';
-import { insightXProClient } from '../supplier/insightxpro.js';
-import type { Order, OrderItem, PaymentTransaction } from '../db/types.js';
+import { insightXProClient, extractSupplierFulfilment } from '../supplier/insightxpro.js';
+import { logger } from '../utils/logger.js';
+import type { Order, OrderItem, PaymentTransaction, Delivery } from '../db/types.js';
 
 export interface PaymentInitializationRequest {
   order_reference: string;
@@ -109,6 +110,7 @@ export class PaymentAdapter {
   async verifyAndFulfill(orderReference: string, paymentReference: string, simulationChannel: string = 'sandbox'): Promise<{
     success: boolean;
     order: Order;
+    deliveries?: Delivery[];
     message: string;
   }> {
     const order = await dbService.queryOne<Order>(`
@@ -119,10 +121,17 @@ export class PaymentAdapter {
       throw new Error(`Order ${orderReference} not found.`);
     }
 
-    if (order.payment_status === 'paid' && order.fulfilment_status === 'fulfilled') {
+    // Check if order was already verified and fulfilled (Idempotency guarantee)
+    const existingDeliveries = await dbService.query<Delivery>(`
+      SELECT * FROM deliveries WHERE order_id = ?
+    `, [order.id]);
+
+    if (order.payment_status === 'paid' && existingDeliveries.length > 0) {
+      logger.info(`Order ${orderReference} already fulfilled idempotently. Returning existing deliveries.`);
       return {
         success: true,
         order,
+        deliveries: existingDeliveries,
         message: 'Order was already verified and fulfilled.'
       };
     }
@@ -138,14 +147,7 @@ export class PaymentAdapter {
 
     const now = new Date().toISOString();
 
-    // Execute atomic transaction for payment status and fulfilment
-    const fulfilmentResult = await dbService.transaction(async () => {
-      // 1. Mark transaction successful
-      const updateTxStmt = (dbService as any); // use query helper
-      return true;
-    });
-
-    // Update payment transaction
+    // 1. Mark payment transaction as successful
     await dbService.run(`
       UPDATE payment_transactions
       SET status = 'successful', webhook_verified = 1, gateway_response = ?
@@ -163,7 +165,12 @@ export class PaymentAdapter {
       WHERE id = ?
     `, [now, order.id]);
 
-    // 3. Fulfill items with supplier client (with idempotency)
+    let lastSupplierOrderId: string | null = order.supplier_order_id || null;
+    let lastSupplierStatus: string = order.supplier_status || 'unprocessed';
+    let lastSupplierRef: string | null = order.supplier_reference || null;
+    let lastSupplierRaw: string | null = order.supplier_raw_response || null;
+
+    // 3. Fulfill items with supplier client (with idempotency per item)
     for (const item of orderItems) {
       const product = await dbService.queryOne<any>(`
         SELECT * FROM products WHERE id = ?
@@ -173,95 +180,211 @@ export class PaymentAdapter {
 
       // Reseller authorization guardrail:
       if (product.reseller_approved !== 1) {
-        console.error(`[Fulfilment BLOCKED] Product ${product.id} is not reseller authorized! Holding order.`);
+        logger.error(`[Fulfilment BLOCKED] Product ${product.id} is not reseller authorized! Holding order.`);
         await dbService.run(`
           UPDATE orders SET fulfilment_status = 'failed', notes = 'Blocked: Reseller authorization was revoked before fulfilment.' WHERE id = ?
         `, [order.id]);
         continue;
       }
 
-      let supplierResult: {
-        success: boolean;
-        delivery_type: string;
-        delivery_content?: string;
-        instructions?: string;
-        expires_at?: string;
-        error_message?: string;
-      };
+      // Check if item already has deliveries recorded
+      const itemDeliveries = await dbService.query<Delivery>(`
+        SELECT * FROM deliveries WHERE order_item_id = ?
+      `, [item.id]);
 
-      if (insightXProClient.isConfigured() && product.source_type === 'insightxpro') {
-        try {
-          const supplierResp = await insightXProClient.placeOrder({
-            product_id: product.source_product_id,
-            quantity: item.quantity,
-            idempotency_key: `${order.idempotency_key}-${item.id}`
-          });
-          supplierResult = {
-            success: true,
-            delivery_type: product.access_type,
-            delivery_content: supplierResp.license || supplierResp.code || supplierResp.order_id || `ORDER-${supplierResp.id}`,
-            instructions: product.delivery_instructions
-          };
-        } catch (err: any) {
-          supplierResult = {
-            success: false,
-            delivery_type: product.access_type,
-            error_message: err.message
-          };
-        }
-      } else {
-        // Sandbox simulation fulfillment generator
-        supplierResult = {
-          success: true,
-          delivery_type: product.access_type,
-          delivery_content: `TP-VERIFIED-${crypto.randomBytes(6).toString('hex').toUpperCase()}`,
-          instructions: product.delivery_instructions
-        };
+      if (itemDeliveries.length >= item.quantity) {
+        logger.info(`Item ${item.id} already has ${itemDeliveries.length} deliveries recorded. Skipping supplier re-purchase.`);
+        continue;
       }
 
-      if (supplierResult.success && supplierResult.delivery_content) {
-        // Record delivery
-        await dbService.run(`
-          INSERT INTO deliveries (
-            id, order_id, order_item_id, delivery_type, license_code_or_credential, delivery_status, instructions, access_expires_at, delivered_at
-          ) VALUES (?, ?, ?, ?, ?, 'delivered', ?, ?, ?)
-        `, [
-          `del-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
-          order.id,
-          item.id,
-          supplierResult.delivery_type,
-          supplierResult.delivery_content,
-          supplierResult.instructions || product.delivery_instructions,
-          supplierResult.expires_at || null,
-          now
-        ]);
+      const neededCount = item.quantity - itemDeliveries.length;
+      const idempotencyKey = `${order.idempotency_key}-${item.id}`;
 
-        // Decrement stock
+      const shouldCallLiveSupplier = this.isLiveEnabled() && insightXProClient.isConfigured() && product.source_type === 'insightxpro' && simulationChannel !== 'test_bank_transfer';
+
+      if (shouldCallLiveSupplier) {
+        try {
+          let extracted: any = null;
+
+          // If this order already has a supplier_order_id (e.g. from a previous pending attempt or timeout), reconcile status first!
+          if (lastSupplierOrderId) {
+            try {
+              logger.info(`Reconciling existing supplier order ${lastSupplierOrderId} before re-attempting purchase...`);
+              const statusResp = await insightXProClient.getOrderStatus(lastSupplierOrderId);
+              extracted = extractSupplierFulfilment(statusResp, product.delivery_instructions);
+              lastSupplierStatus = extracted.supplier_status;
+            } catch (reconErr: any) {
+              logger.warn(`Supplier status reconciliation failed for ${lastSupplierOrderId}: ${reconErr.message}`);
+            }
+          }
+
+          // If not already resolved via existing supplier order, place the purchase with the deterministic idempotency key
+          if (!extracted || extracted.items.length === 0) {
+            if (!lastSupplierOrderId) {
+              const supplierResp = await insightXProClient.placeOrder({
+                product_id: product.source_product_id,
+                quantity: neededCount,
+                idempotency_key: idempotencyKey
+              });
+
+              extracted = extractSupplierFulfilment(supplierResp, product.delivery_instructions);
+              if (extracted.supplier_order_id) {
+                lastSupplierOrderId = extracted.supplier_order_id;
+              }
+              lastSupplierStatus = extracted.supplier_status;
+              lastSupplierRef = idempotencyKey;
+
+              // If initial purchase response did not contain the codes/links, but has a supplier order ID, check order-status endpoint
+              if (extracted.items.length === 0 && extracted.supplier_order_id) {
+                try {
+                  logger.info(`Checking live status for supplier order ${extracted.supplier_order_id}...`);
+                  const statusResp = await insightXProClient.getOrderStatus(extracted.supplier_order_id);
+                  const statusExtracted = extractSupplierFulfilment(statusResp, product.delivery_instructions);
+                  if (statusExtracted.items.length > 0) {
+                    extracted = statusExtracted;
+                    lastSupplierStatus = statusExtracted.supplier_status;
+                  }
+                } catch (statusErr: any) {
+                  logger.warn(`Immediate order status query failed: ${statusErr.message}`);
+                }
+              }
+            }
+          }
+
+          lastSupplierRaw = extracted ? JSON.stringify(extracted.raw_sanitized) : null;
+
+          if (extracted.items.length > 0) {
+            for (const delItem of extracted.items) {
+              await dbService.run(`
+                INSERT INTO deliveries (
+                  id, order_id, order_item_id, delivery_type, delivery_format,
+                  license_code_or_credential, redemption_url, supplier_order_id, raw_code_or_link,
+                  delivery_status, instructions, access_expires_at, delivered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delivered', ?, ?, ?)
+              `, [
+                `del-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+                order.id,
+                item.id,
+                product.access_type,
+                delItem.delivery_format,
+                delItem.delivery_content,
+                delItem.redemption_url || null,
+                extracted.supplier_order_id,
+                delItem.delivery_content,
+                delItem.instructions || product.delivery_instructions,
+                null,
+                now
+              ]);
+            }
+
+            // Decrement stock count safely
+            await dbService.run(`
+              UPDATE products
+              SET stock_count = MAX(0, stock_count - ?), updated_at = ?
+              WHERE id = ?
+            `, [neededCount, now, product.id]);
+          } else {
+            // If supplier marked it completed but returned no credential, enter reconciliation state
+            if (extracted.supplier_status === 'completed') {
+              logger.error(`[Supplier Alert] Order ${extracted.supplier_order_id} marked completed by supplier but returned no credential. Entering reconciliation.`);
+              await dbService.run(`
+                UPDATE orders SET fulfilment_status = 'processing', notes = 'RECONCILIATION REQUIRED: Supplier order marked completed but returned no digital credential.' WHERE id = ?
+              `, [order.id]);
+            } else {
+              // Supplier accepted but order is pending in queue
+              logger.info(`Supplier order ${extracted.supplier_order_id} is currently in pending state.`);
+              await dbService.run(`
+                UPDATE orders SET fulfilment_status = 'processing', notes = 'Supplier accepted order and queued in processing pipeline.' WHERE id = ?
+              `, [order.id]);
+            }
+          }
+        } catch (err: any) {
+          logger.error('Supplier fulfilment exception', { error: err.message, item_id: item.id });
+          lastSupplierStatus = 'error';
+          await dbService.run(`
+            UPDATE orders SET fulfilment_status = 'processing', notes = ? WHERE id = ?
+          `, [`Supplier purchase error: ${err.message}. Retaining order for reconciliation.`, order.id]);
+        }
+      } else {
+        // Controlled test fulfillment generator producing genuine InsightXPro format (no synthetic "undefined" values)
+        lastSupplierOrderId = `IX-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+        lastSupplierStatus = 'completed';
+        lastSupplierRef = idempotencyKey;
+        lastSupplierRaw = JSON.stringify({
+          supplier_order_id: lastSupplierOrderId,
+          product_id: product.source_product_id,
+          product_name: product.title,
+          status: 'completed',
+          simulation: 'test_bank_transfer',
+          created_at: now
+        });
+
+        for (let q = 0; q < neededCount; q++) {
+          const isLink = product.access_type === 'digital_access' || product.title.toLowerCase().includes('gemini') || product.title.toLowerCase().includes('canva');
+          const token = isLink
+            ? `https://serviceactivation.in/subscription/new/${crypto.randomBytes(6).toString('hex')}`
+            : `TP-${crypto.randomBytes(4).toString('hex').toUpperCase()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
+          const format = isLink ? 'redemption_url' : 'license_key';
+          const instructions = product.delivery_instructions || (isLink
+            ? 'Open your unique activation URL to redeem and link your subscription directly on the service portal.'
+            : 'Enter this activation license key into your software or account settings.');
+
+          await dbService.run(`
+            INSERT INTO deliveries (
+              id, order_id, order_item_id, delivery_type, delivery_format,
+              license_code_or_credential, redemption_url, supplier_order_id, raw_code_or_link,
+              delivery_status, instructions, access_expires_at, delivered_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'delivered', ?, ?, ?)
+          `, [
+            `del-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+            order.id,
+            item.id,
+            product.access_type,
+            format,
+            token,
+            isLink ? token : null,
+            lastSupplierOrderId,
+            token,
+            instructions,
+            null,
+            now
+          ]);
+        }
+
         await dbService.run(`
           UPDATE products
           SET stock_count = MAX(0, stock_count - ?), updated_at = ?
           WHERE id = ?
-        `, [item.quantity, now, product.id]);
-      } else {
-        console.error(`[Supplier Fulfilment Failure] Item ${item.id}:`, supplierResult.error_message);
-        await dbService.run(`
-          UPDATE orders SET fulfilment_status = 'processing', notes = ? WHERE id = ?
-        `, [supplierResult.error_message || 'Fulfilment queued for manual supplier reconciliation', order.id]);
+        `, [neededCount, now, product.id]);
       }
     }
 
-    // Check if deliveries are complete
-    const deliveriesCount = await dbService.queryOne<{ count: number }>(`
-      SELECT COUNT(*) as count FROM deliveries WHERE order_id = ?
+    // Check all recorded deliveries for this order
+    const allDeliveries = await dbService.query<Delivery>(`
+      SELECT * FROM deliveries WHERE order_id = ?
     `, [order.id]);
 
-    const isFulfilled = (deliveriesCount?.count || 0) >= orderItems.length;
+    const totalRequiredQuantity = orderItems.reduce((acc, it) => acc + it.quantity, 0);
+    const isFulfilled = allDeliveries.length >= totalRequiredQuantity;
 
     await dbService.run(`
       UPDATE orders
-      SET fulfilment_status = ?, updated_at = ?
+      SET fulfilment_status = ?,
+          supplier_order_id = COALESCE(?, supplier_order_id),
+          supplier_status = COALESCE(?, supplier_status),
+          supplier_reference = COALESCE(?, supplier_reference),
+          supplier_raw_response = COALESCE(?, supplier_raw_response),
+          updated_at = ?
       WHERE id = ?
-    `, [isFulfilled ? 'fulfilled' : 'processing', now, order.id]);
+    `, [
+      isFulfilled ? 'fulfilled' : 'processing',
+      lastSupplierOrderId,
+      lastSupplierStatus,
+      lastSupplierRef,
+      lastSupplierRaw,
+      now,
+      order.id
+    ]);
 
     // Record audit log
     await dbService.run(`
@@ -270,10 +393,10 @@ export class PaymentAdapter {
     `, [
       `log-${Date.now()}`,
       'PAYMENT_ADAPTER',
-      'ORDER_PAID_AND_FULFILLED',
+      isFulfilled ? 'ORDER_FULFILLED' : 'ORDER_PROCESSING',
       'order',
       order.id,
-      `Verified payment for ₦${order.total_amount.toLocaleString()} (${order.order_reference}). Fulfilment status: ${isFulfilled ? 'fulfilled' : 'processing'}.`,
+      `Payment verified for ${order.currency} ${order.total_amount.toLocaleString()} (${order.order_reference}). Supplier order: ${lastSupplierOrderId || 'N/A'}. Status: ${isFulfilled ? 'fulfilled' : 'processing'}.`,
       '127.0.0.1',
       now
     ]);
@@ -285,7 +408,10 @@ export class PaymentAdapter {
     return {
       success: true,
       order: updatedOrder!,
-      message: 'Payment verified and digital delivery processed successfully.'
+      deliveries: allDeliveries,
+      message: isFulfilled
+        ? 'Payment verified and digital delivery processed successfully.'
+        : 'Payment verified. Digital access is processing with supplier queue.'
     };
   }
 }

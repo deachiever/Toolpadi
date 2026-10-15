@@ -89,9 +89,31 @@ export function AppContent() {
     setCurrentView('product_detail');
   };
 
+  // Recover confirmed order on reload if on order_confirmation view
+  useEffect(() => {
+    if (currentView === 'order_confirmation' && !confirmedOrder) {
+      const lastRef = localStorage.getItem('toolpadi_last_order_ref');
+      if (lastRef) {
+        fetch(`/api/orders/${lastRef}`)
+          .then(res => res.json())
+          .then(data => {
+            if (data.order) {
+              setConfirmedOrder(data.order);
+              setConfirmedDeliveries(data.deliveries || []);
+            }
+          })
+          .catch(() => {});
+      }
+    }
+  }, [currentView, confirmedOrder]);
+
   const handleCheckoutSuccess = (order: Order, deliveries: Delivery[]) => {
     setConfirmedOrder(order);
     setConfirmedDeliveries(deliveries);
+    try {
+      localStorage.setItem('toolpadi_last_order_ref', order.order_reference);
+      localStorage.setItem('toolpadi_last_order_email', order.customer_email);
+    } catch {}
     window.scrollTo({ top: 0, behavior: 'smooth' });
     setCurrentView('order_confirmation');
     fetchProducts(); // Refresh stock
@@ -141,13 +163,28 @@ export function AppContent() {
           />
         )}
 
-        {currentView === 'order_confirmation' && confirmedOrder && (
-          <OrderConfirmationView
-            order={confirmedOrder}
-            deliveries={confirmedDeliveries}
-            onNavigateHome={() => handleNavigate('home')}
-            onNavigateSupport={() => handleNavigate('support', confirmedOrder.order_reference)}
-          />
+        {currentView === 'order_confirmation' && (
+          confirmedOrder ? (
+            <OrderConfirmationView
+              order={confirmedOrder}
+              deliveries={confirmedDeliveries}
+              onNavigateHome={() => handleNavigate('home')}
+              onNavigateSupport={() => handleNavigate('support', confirmedOrder.order_reference)}
+              onRefreshOrder={async (ref) => {
+                const res = await fetch(`/api/orders/${ref}`);
+                const data = await res.json();
+                if (data.order) {
+                  setConfirmedOrder(data.order);
+                  setConfirmedDeliveries(data.deliveries || []);
+                }
+              }}
+            />
+          ) : (
+            <div className="max-w-md mx-auto py-24 text-center space-y-4">
+              <div className="animate-spin w-8 h-8 border-2 border-[#16a34a] border-t-transparent rounded-full mx-auto" />
+              <p className="text-xs text-[#5a6760] font-medium">Retrieving your order confirmation and digital credentials...</p>
+            </div>
+          )
         )}
 
         {currentView === 'account' && (

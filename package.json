@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "start": "tsx server.ts",
     "migrate": "tsx scripts/migrate.ts",
-    "test": "tsx server/tests/verification.test.ts && tsx server/tests/supplier-integration.test.ts && tsx server/tests/bulk-pricing.test.ts",
+    "test": "tsx server/tests/verification.test.ts && tsx server/tests/supplier-integration.test.ts && tsx server/tests/bulk-pricing.test.ts && tsx server/tests/fulfilment-and-delivery.test.ts",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"
   },
